@@ -1,0 +1,7 @@
+__pycache__/
+experiment_data/
+coverage_csvs/
+temp_*
+*.log
+*.tar
+.DS_Store
