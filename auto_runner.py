@@ -14,6 +14,7 @@ OUTPUT_DIR = ""
 SAMPLE_RATIO = 3.0
 REMOTE_WORKDIR = "/app"
 MVN_EXECUTABLE = "mvn"
+BUILD_SYSTEM = "maven" # "maven" or "gradle"
 # =================================================================
 
 def run_cmd(cmd, silent=False):
@@ -65,18 +66,31 @@ def step0_check_tests_existence():
         print("   ✅ Tests detected.")
 
 def step1_prepare_environment():
-    """Step 1: Put Parser into container and modify POM"""
-    global MVN_EXECUTABLE
+    """Step 1: Put Parser into container and modify POM or Init Gradle"""
+    global MVN_EXECUTABLE, BUILD_SYSTEM
     print(f"\n📦 Step 1: Preparing Environment for [{CONTAINER_NAME}]...")
     
-    # Check for mvnw
-    res = run_cmd(f"docker exec -w {REMOTE_WORKDIR} {CONTAINER_NAME} test -f mvnw")
-    if res.returncode == 0:
-        print("   ✅ Maven Wrapper (mvnw) detected. Using ./mvnw")
-        MVN_EXECUTABLE = "./mvnw"
+    # Detect Build System
+    if run_cmd(f"docker exec -w {REMOTE_WORKDIR} {CONTAINER_NAME} test -f pom.xml").returncode == 0:
+        BUILD_SYSTEM = "maven"
+        print("   ✅ Detected Maven project.")
+    elif run_cmd(f"docker exec -w {REMOTE_WORKDIR} {CONTAINER_NAME} test -f build.gradle").returncode == 0 or \
+         run_cmd(f"docker exec -w {REMOTE_WORKDIR} {CONTAINER_NAME} test -f build.gradle.kts").returncode == 0:
+        BUILD_SYSTEM = "gradle"
+        print("   ✅ Detected Gradle project.")
     else:
-        print("   ℹ️ Maven Wrapper not found. Using system mvn")
-        MVN_EXECUTABLE = "mvn"
+        print("   ⚠️ Could not detect pom.xml or build.gradle. Defaulting to Maven.")
+        BUILD_SYSTEM = "maven"
+
+    # Check for mvnw (only if Maven)
+    if BUILD_SYSTEM == "maven":
+        res = run_cmd(f"docker exec -w {REMOTE_WORKDIR} {CONTAINER_NAME} test -f mvnw")
+        if res.returncode == 0:
+            print("   ✅ Maven Wrapper (mvnw) detected. Using ./mvnw")
+            MVN_EXECUTABLE = "./mvnw"
+        else:
+            print("   ℹ️ Maven Wrapper not found. Using system mvn")
+            MVN_EXECUTABLE = "mvn"
     
     # 1.1 Upload Parser JAR to container root directory (/app)
     print(f"   Uploading {PARSER_JAR_NAME}...")
@@ -86,25 +100,51 @@ def step1_prepare_environment():
 
     run_cmd(f"docker cp {PARSER_JAR_NAME} {CONTAINER_NAME}:{REMOTE_WORKDIR}/parser.jar")
 
-    # 1.2 Inject JaCoCo into pom.xml
-    print("   Injecting JaCoCo into pom.xml...")
-    # First clean up any local remaining temp files
-    if os.path.exists("./temp_pom.xml"): os.remove("./temp_pom.xml")
-    
-    res = run_cmd(f"docker cp {CONTAINER_NAME}:{REMOTE_WORKDIR}/pom.xml ./temp_pom.xml")
-    if res.returncode != 0:
-        print(f"❌ Failed to copy pom.xml from container. Is container '{CONTAINER_NAME}' running?")
-        sys.exit(1)
-    
-    try:
-        inject_jacoco_into_pom("./temp_pom.xml") # Call pom_modifier.py
-        run_cmd(f"docker cp ./temp_pom.xml {CONTAINER_NAME}:{REMOTE_WORKDIR}/pom.xml")
-        print("   ✅ JaCoCo injected.")
-    except Exception as e:
-        print(f"❌ POM modification failed: {e}")
-        sys.exit(1)
-    finally:
+    # 1.2 Inject JaCoCo
+    if BUILD_SYSTEM == "maven":
+        print("   Injecting JaCoCo into pom.xml...")
+        # First clean up any local remaining temp files
         if os.path.exists("./temp_pom.xml"): os.remove("./temp_pom.xml")
+        
+        res = run_cmd(f"docker cp {CONTAINER_NAME}:{REMOTE_WORKDIR}/pom.xml ./temp_pom.xml")
+        if res.returncode != 0:
+            print(f"❌ Failed to copy pom.xml from container. Is container '{CONTAINER_NAME}' running?")
+            sys.exit(1)
+        
+        try:
+            inject_jacoco_into_pom("./temp_pom.xml") # Call pom_modifier.py
+            run_cmd(f"docker cp ./temp_pom.xml {CONTAINER_NAME}:{REMOTE_WORKDIR}/pom.xml")
+            print("   ✅ JaCoCo injected.")
+        except Exception as e:
+            print(f"❌ POM modification failed: {e}")
+            sys.exit(1)
+        finally:
+            if os.path.exists("./temp_pom.xml"): os.remove("./temp_pom.xml")
+            
+    elif BUILD_SYSTEM == "gradle":
+        print("   Creating Gradle init script for JaCoCo...")
+        init_script_content = """
+allprojects {
+    apply plugin: 'jacoco'
+    
+    tasks.withType(Test) {
+        finalizedBy 'jacocoTestReport'
+    }
+    
+    tasks.withType(JacocoReport) {
+        reports {
+            xml.required = true
+            csv.required = false
+            html.required = false
+        }
+    }
+}
+"""
+        with open("jacoco_init.gradle", "w") as f:
+            f.write(init_script_content)
+            
+        run_cmd(f"docker cp jacoco_init.gradle {CONTAINER_NAME}:{REMOTE_WORKDIR}/jacoco_init.gradle")
+        print("   ✅ Gradle init script uploaded.")
 
 def step2_run_parser_and_get_tests():
     """Step 2: Run Parser locally (to avoid Java version mismatch in container)"""
@@ -213,11 +253,21 @@ def step3_run_tests_loop(test_list, category):
 
         print(f"   [{i+1}/{len(test_list)}] Running: {test_id}")
         
-        # Clean up any existing jacoco.xml files in any module
+        # Clean up any existing jacoco.xml AND jacoco.exec files to prevent accumulation
         run_cmd(f"docker exec -w {REMOTE_WORKDIR} {CONTAINER_NAME} find . -name jacoco.xml -delete", silent=True)
+        run_cmd(f"docker exec -w {REMOTE_WORKDIR} {CONTAINER_NAME} find . -name '*.exec' -delete", silent=True)
         
-        mvn_cmd = f"docker exec -w {REMOTE_WORKDIR} {CONTAINER_NAME} {MVN_EXECUTABLE} test -Dtest={test_id} -DfailIfNoTests=false -Drat.skip=true"
-        res = run_cmd(mvn_cmd, silent=True)
+        if BUILD_SYSTEM == "maven":
+            mvn_cmd = f"docker exec -w {REMOTE_WORKDIR} {CONTAINER_NAME} {MVN_EXECUTABLE} test -Dtest={test_id} -DfailIfNoTests=false -Drat.skip=true"
+            res = run_cmd(mvn_cmd, silent=True)
+        elif BUILD_SYSTEM == "gradle":
+            # Gradle test filter uses dots instead of #
+            gradle_filter = test_id.replace("#", ".")
+            # Use ./gradlew if available, else gradle
+            # We assume gradlew is present for Gradle projects usually
+            # Use --no-daemon to prevent OOM issues in Docker
+            gradle_cmd = f"docker exec -w {REMOTE_WORKDIR} {CONTAINER_NAME} ./gradlew test --tests {gradle_filter} jacocoTestReport -I jacoco_init.gradle --no-daemon"
+            res = run_cmd(gradle_cmd, silent=True)
 
         if res.returncode != 0:
             print(f"   ❌ Build/Test Failed for {test_id}. See build_failures.log")
@@ -228,7 +278,8 @@ def step3_run_tests_loop(test_list, category):
                 log_file.write("\n==================\n")
         
         # Find the generated jacoco.xml (it should be in one of the modules)
-        find_res = run_cmd(f"docker exec -w {REMOTE_WORKDIR} {CONTAINER_NAME} find . -name jacoco.xml | head -n 1", silent=True)
+        # For Gradle it is usually build/reports/jacoco/test/jacocoTestReport.xml
+        find_res = run_cmd(f"docker exec -w {REMOTE_WORKDIR} {CONTAINER_NAME} find . -name jacoco.xml -o -name jacocoTestReport.xml | head -n 1", silent=True)
         remote_path = find_res.stdout.strip()
         
         if remote_path:

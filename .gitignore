@@ -5,3 +5,4 @@ temp_*
 *.log
 *.tar
 .DS_Store
+jacoco_init.gradle
