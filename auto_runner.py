@@ -253,8 +253,9 @@ def step3_run_tests_loop(test_list, category):
 
         print(f"   [{i+1}/{len(test_list)}] Running: {test_id}")
         
-        # Clean up any existing jacoco.xml AND jacoco.exec files to prevent accumulation
+        # Clean up any existing jacoco.xml, jacocoTestReport.xml AND *.exec files to prevent accumulation
         run_cmd(f"docker exec -w {REMOTE_WORKDIR} {CONTAINER_NAME} find . -name jacoco.xml -delete", silent=True)
+        run_cmd(f"docker exec -w {REMOTE_WORKDIR} {CONTAINER_NAME} find . -name jacocoTestReport.xml -delete", silent=True)
         run_cmd(f"docker exec -w {REMOTE_WORKDIR} {CONTAINER_NAME} find . -name '*.exec' -delete", silent=True)
         
         if BUILD_SYSTEM == "maven":
@@ -283,6 +284,7 @@ def step3_run_tests_loop(test_list, category):
         remote_path = find_res.stdout.strip()
         
         if remote_path:
+            # print(f"   📄 Found report: {remote_path}")
             if remote_path.startswith("./"): remote_path = remote_path[2:]
             os.makedirs(os.path.dirname(local_xml), exist_ok=True)
             run_cmd(f"docker cp {CONTAINER_NAME}:{REMOTE_WORKDIR}/{remote_path} {local_xml}", silent=True)
